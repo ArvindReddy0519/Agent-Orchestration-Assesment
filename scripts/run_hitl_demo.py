@@ -45,7 +45,16 @@ def run_until_interrupt(requirement: str) -> tuple[object, dict]:
     config = {"configurable": {"thread_id": str(uuid.uuid4())}}
 
     result = graph.invoke(
-        {"requirement": requirement, "retry_count": 0, "errors": ""},
+        {
+            "requirement": requirement,
+            "retry_count": 0,
+            "errors": "",
+            "completed_tasks": {},
+            "artifacts": {},
+            "artifact_reviews": {},
+            "tasks": [],
+            "architecture_decisions": [],
+        },
         config,
     )
 
@@ -87,9 +96,12 @@ def demo_rejected(requirement: str) -> None:
 
 def _print_state(state: dict) -> None:
     print("\nFinal state:")
-    for key in ("requirement", "plan", "human_feedback", "code", "errors", "retry_count"):
+    for key in ("requirement", "plan", "human_feedback", "code", "errors", "retry_count", "tasks"):
         if key in state:
-            print(f"  {key}: {state[key]!r}")
+            if key == "tasks":
+                print(f"  {key}: {len(state[key])} task(s)")
+            else:
+                print(f"  {key}: {state[key]!r}")
 
 
 def main() -> None:

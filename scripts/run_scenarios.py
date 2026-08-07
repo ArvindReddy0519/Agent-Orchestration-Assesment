@@ -1,4 +1,4 @@
-"""Run URL shortener orchestration scenarios with interactive human-in-the-loop approval.
+"""Run the orchestration workflow with a dynamic requirement and interactive HITL approval.
 
 Requires a Groq API key for LLM nodes (planner, coder, reviewer):
 
@@ -8,16 +8,14 @@ Or place GROQ_API_KEY in a `.env` file in the project root (loaded automatically
 
 Examples:
 
-    python scripts/run_scenarios.py --scenario greenfield
-    python scripts/run_scenarios.py --scenario brownfield
-    python scripts/run_scenarios.py --scenario ambiguous
+    python scripts/run_scenarios.py --requirement "Build a URL shortener REST API"
+    python scripts/run_scenarios.py
 """
 
 from __future__ import annotations
 
 import argparse
 import sys
-import textwrap
 import uuid
 from pathlib import Path
 from typing import Any
@@ -34,76 +32,6 @@ load_dotenv(ROOT / ".env")
 from orchestrator.graph import build_graph
 from orchestrator.file_writer import save_generated_java_code
 from orchestrator.llm import ensure_groq_api_key
-
-SCENARIO_REQUIREMENTS: dict[str, str] = {
-    "greenfield": textwrap.dedent(
-        """
-        Build a new URL shortener REST API from scratch using Java 17, Spring Boot 3,
-        and an in-memory or H2 JPA store for the MVP.
-
-        Functional requirements:
-        - POST /api/shorten accepts {"url": "<long url>", "alias": "<optional custom slug>"}
-          and returns {"shortUrl": "...", "targetUrl": "..."}.
-        - GET /{slug} redirects (HTTP 307) to the original URL.
-        - Reject invalid URLs, duplicate aliases, and reserved slugs (e.g. "health", "actuator").
-        - Include GET /actuator/health or equivalent health endpoint.
-
-        Non-functional requirements:
-        - Use DTOs with Jakarta Bean Validation (@Valid, @NotBlank, @URL).
-        - Layered architecture: controller, service, repository, entity.
-        - Include @ControllerAdvice for consistent error responses.
-        - Provide JUnit 5 tests with MockMvc.
-        - Structure persistence so Redis or PostgreSQL can replace H2 later.
-        """
-    ).strip(),
-    "brownfield": textwrap.dedent(
-        """
-        Extend the existing Spring Boot URL shortener service below. Do not rewrite from
-        scratch; preserve current endpoints and behavior, then add the requested features.
-
-        Existing service (Spring Boot 3 + in-memory JPA):
-
-        ```java
-        // UrlController.java — simplified legacy MVP
-        @RestController
-        public class UrlController {
-            private final UrlService urlService;
-
-            public UrlController(UrlService urlService) {
-                this.urlService = urlService;
-            }
-
-            @PostMapping("/shorten")
-            public ShortenResponse shorten(@Valid @RequestBody ShortenRequest request) {
-                return urlService.shorten(request.getUrl());
-            }
-
-            @GetMapping("/{slug}")
-            public ResponseEntity<Void> redirect(@PathVariable String slug) {
-                return ResponseEntity.status(HttpStatus.TEMPORARY_REDIRECT)
-                    .location(URI.create(urlService.resolve(slug)))
-                    .build();
-            }
-        }
-        ```
-
-        Required enhancements:
-        - Optional custom alias on POST /shorten; return 409 when alias already exists.
-        - Track click counts per slug; expose GET /stats/{slug}.
-        - Add TTL support via optional expiresInSeconds on shorten; expired links return 410.
-        - Keep backward compatibility for clients that only send {"url": "..."}.
-        - Add/update JUnit 5 tests for new behavior.
-        """
-    ).strip(),
-    "ambiguous": textwrap.dedent(
-        """
-        We need a URL shortener for our startup. Users should be able to make links
-        shorter and share them. It should be fast, secure, and "enterprise ready."
-        Maybe add analytics if that's easy. Use whatever stack you think is best.
-        We might need auth later but not sure yet. Ship something we can demo next week.
-        """
-    ).strip(),
-}
 
 
 def _print_interrupt(payload: dict[str, Any]) -> None:
@@ -138,22 +66,59 @@ def _prompt_approval() -> str:
         print("Invalid input. Use 'Approved' or 'Rejected: <feedback>'.")
 
 
+def _prompt_requirement() -> str:
+    """Read a multi-line requirement from the terminal."""
+    print(
+        "Enter your requirement below. Press Enter on an empty line when finished:\n"
+    )
+    lines: list[str] = []
+    while True:
+        try:
+            line = input()
+        except EOFError:
+            break
+        if line == "" and lines:
+            break
+        lines.append(line)
+
+    requirement = "\n".join(lines).strip()
+    if not requirement:
+        print("No requirement provided.", file=sys.stderr)
+        raise SystemExit(1)
+    return requirement
+
+
+def _resolve_requirement(cli_requirement: str | None) -> str:
+    if cli_requirement and cli_requirement.strip():
+        return cli_requirement.strip()
+    if not sys.stdin.isatty():
+        piped = sys.stdin.read().strip()
+        if piped:
+            return piped
+    return _prompt_requirement()
+
+
 def _summarize_update(node: str, update: dict[str, Any]) -> str:
-    if node == "planner" and "plan" in update:
-        plan = update["plan"]
-        preview = plan[:120].replace("\n", " ")
-        suffix = "..." if len(plan) > 120 else ""
-        return f"plan generated ({len(plan)} chars): {preview}{suffix}"
-    if node == "coder" and "code" in update:
+    if node == "planner" and "tasks" in update:
+        count = len(update.get("tasks", []))
+        return f"execution plan generated ({count} tasks)"
+    if node == "coder" and "completed_tasks" in update:
+        task_ids = ", ".join(update["completed_tasks"].keys())
+        return f"task completed: {task_ids}"
+    if node == "reviewer" and "artifact_reviews" in update:
+        paths = ", ".join(update["artifact_reviews"].keys())
+        return f"artifact(s) reviewed: {paths}"
+    if node == "assemble_code" and "code" in update:
         code = update["code"]
-        lines = code.count("\n") + 1 if code else 0
-        return f"code generated ({lines} lines, {len(code)} chars)"
-    if node == "reviewer" and "errors" in update:
-        errors = update["errors"].strip()
-        if errors:
-            finding_count = errors.count("\n") + 1
-            return f"review failed ({finding_count} finding(s))"
-        return "review passed (APPROVED)"
+        return f"assembled codebase ({len(code)} chars)"
+    if node == "summarize_reviews":
+        if "review_summary" in update:
+            summary = update["review_summary"].strip()
+            if update.get("errors", "").strip():
+                return f"review summary: findings recorded ({len(summary)} chars)"
+            return "review summary: all artifacts APPROVED"
+        if "errors" in update and update["errors"].strip():
+            return "review summary: findings recorded"
     if node == "increment_retry" and "retry_count" in update:
         return f"retry_count -> {update['retry_count']}"
     if node == "approval" and "human_feedback" in update:
@@ -162,8 +127,7 @@ def _summarize_update(node: str, update: dict[str, Any]) -> str:
     return f"updated: {keys}"
 
 
-def run_scenario(scenario: str) -> None:
-    requirement = SCENARIO_REQUIREMENTS[scenario]
+def run_scenario(requirement: str) -> None:
     graph = build_graph()
     config = {"configurable": {"thread_id": str(uuid.uuid4())}}
 
@@ -171,10 +135,18 @@ def run_scenario(scenario: str) -> None:
         "requirement": requirement,
         "retry_count": 0,
         "errors": "",
+        "completed_tasks": {},
+        "artifacts": {},
+        "artifact_reviews": {},
+        "tasks": [],
+        "architecture_decisions": [],
     }
 
+    preview = requirement[:80].replace("\n", " ")
+    if len(requirement) > 80:
+        preview += "..."
     logs: list[str] = [
-        f"scenario={scenario}",
+        f"requirement={preview!r}",
         f"thread_id={config['configurable']['thread_id']}",
         "workflow started",
     ]
@@ -212,9 +184,12 @@ def run_scenario(scenario: str) -> None:
     print("\n" + "=" * 60)
     print("FINAL STATE SUMMARY")
     print("=" * 60)
-    for key in ("retry_count", "errors", "human_feedback"):
+    for key in ("retry_count", "errors", "human_feedback", "tasks", "review_summary"):
         if key in final_state:
-            print(f"  {key}: {final_state[key]!r}")
+            if key == "tasks":
+                print(f"  tasks: {len(final_state[key])} task(s)")
+            else:
+                print(f"  {key}: {final_state[key]!r}")
 
     print("\n" + "=" * 60)
     print("GENERATED CODE")
@@ -236,20 +211,19 @@ def run_scenario(scenario: str) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Run URL shortener orchestration scenarios with interactive plan approval. "
-            "Set GROQ_API_KEY before running."
+            "Run the multi-agent orchestration workflow with a dynamic requirement "
+            "and interactive plan approval. Set GROQ_API_KEY before running."
         ),
     )
     parser.add_argument(
-        "--scenario",
-        choices=sorted(SCENARIO_REQUIREMENTS),
-        required=True,
-        help="Scenario requirement to load: greenfield, brownfield, or ambiguous",
+        "--requirement",
+        help="Natural-language product requirement passed to the planner",
     )
     args = parser.parse_args()
 
     ensure_groq_api_key()
-    run_scenario(args.scenario)
+    requirement = _resolve_requirement(args.requirement)
+    run_scenario(requirement)
 
 
 if __name__ == "__main__":

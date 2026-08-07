@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import os
 import re
+import time
 from pathlib import Path
 
 from dotenv import load_dotenv
 from groq import APIError, AuthenticationError, Groq
 from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import BaseMessage
 from langchain_groq import ChatGroq
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -79,15 +81,50 @@ def ensure_groq_api_key() -> str:
 
 
 def get_chat_model() -> BaseChatModel:
-    """Return a Groq chat model configured from environment variables."""
-    api_key = ensure_groq_api_key()
-    model = _resolve_groq_model()
-    print(f"DEBUG: Initializing ChatGroq with model={model!r}")
-    return ChatGroq(
-        model=model,
-        api_key=api_key,
-        temperature=0,
-    )
+    """Return a cached Groq chat model configured from environment variables."""
+    global _chat_model
+    if _chat_model is None:
+        api_key = ensure_groq_api_key()
+        model = _resolve_groq_model()
+        print(f"DEBUG: Initializing ChatGroq with model={model!r}")
+        _chat_model = ChatGroq(
+            model=model,
+            api_key=api_key,
+            temperature=0,
+        )
+    return _chat_model
+
+
+def invoke_with_rate_limit_retry(
+    llm: BaseChatModel,
+    messages: list[BaseMessage],
+    *,
+    max_retries: int = 5,
+):
+    """Invoke the chat model, backing off on Groq TPM rate limits."""
+    for attempt in range(max_retries):
+        try:
+            return llm.invoke(messages)
+        except Exception as exc:
+            message = str(exc).lower()
+            if "413" in message or "too large" in message or "reduce your message size" in message:
+                raise
+            if "rate_limit" not in message and "429" not in message:
+                raise
+            if attempt == max_retries - 1:
+                raise
+            wait_seconds = 25.0
+            match = re.search(r"try again in ([\d.]+)s", str(exc), re.IGNORECASE)
+            if match:
+                wait_seconds = float(match.group(1)) + 1.0
+            print(
+                f"WARNING: Groq rate limit hit (attempt {attempt + 1}/{max_retries}); "
+                f"sleeping {wait_seconds:.0f}s..."
+            )
+            time.sleep(wait_seconds)
+
+
+_chat_model: BaseChatModel | None = None
 
 
 def message_text(content: object) -> str:
@@ -137,3 +174,130 @@ def format_review_errors(text: str) -> str:
     if not findings:
         return ""
     return "\n".join(f"- {finding}" for finding in findings)
+
+
+_FAILURE_KEYWORDS = frozenset(
+    {
+        "security",
+        "vulnerability",
+        "critical",
+        "syntax",
+        "compile",
+        "invalid",
+        "missing",
+        "incorrect",
+        "broken",
+        " must ",
+        "required",
+        "sql injection",
+        "xss",
+        "csrf",
+        "runtime error",
+        "does not",
+        "doesn't",
+        " fail",
+        "failed",
+        "error",
+    }
+)
+
+_WARNING_KEYWORDS = frozenset(
+    {
+        "consider",
+        "recommend",
+        " should ",
+        "could",
+        "minor",
+        "style",
+        "optional",
+        "improve",
+        "prefer",
+        "warning",
+        "nit",
+    }
+)
+
+
+def classify_review_finding(finding: str) -> str:
+    """Classify a single review finding as 'failure' or 'warning'."""
+    lowered = f" {finding.lower()} "
+    if any(keyword in lowered for keyword in _FAILURE_KEYWORDS):
+        return "failure"
+    if any(keyword in lowered for keyword in _WARNING_KEYWORDS):
+        return "warning"
+    return "failure"
+
+
+def aggregate_artifact_reviews(artifact_reviews: dict[str, str]) -> dict[str, str]:
+    """Build review_summary and errors from per-artifact reviews without an LLM."""
+    approved_paths: list[str] = []
+    warning_entries: list[tuple[str, list[str]]] = []
+    failure_entries: list[tuple[str, list[str]]] = []
+
+    for path in sorted(artifact_reviews):
+        result = artifact_reviews[path].strip()
+        if result.upper() == "APPROVED":
+            approved_paths.append(path)
+            continue
+
+        findings = parse_review_findings(result)
+        if not findings:
+            findings = [result] if result else ["Review returned no actionable findings."]
+
+        warning_findings: list[str] = []
+        failure_findings: list[str] = []
+        for finding in findings:
+            if classify_review_finding(finding) == "warning":
+                warning_findings.append(finding)
+            else:
+                failure_findings.append(finding)
+
+        if failure_findings:
+            failure_entries.append((path, failure_findings))
+        if warning_findings:
+            warning_entries.append((path, warning_findings))
+
+    reviewed_count = len(artifact_reviews)
+    approved_count = len(approved_paths)
+    warning_artifact_count = len(warning_entries)
+    failure_artifact_count = len(failure_entries)
+
+    lines = [
+        "Engineering Review Summary",
+        "==========================",
+        (
+            f"Reviewed: {reviewed_count} | Approved: {approved_count} | "
+            f"Warnings: {warning_artifact_count} | Failures: {failure_artifact_count}"
+        ),
+    ]
+
+    if approved_paths:
+        lines.extend(["", "Approved artifacts:"])
+        lines.extend(f"- {path}" for path in approved_paths)
+
+    if warning_entries:
+        lines.extend(["", "Warnings:"])
+        for path, findings in warning_entries:
+            lines.append(f"- {path}:")
+            lines.extend(f"  - {finding}" for finding in findings)
+
+    if failure_entries:
+        lines.extend(["", "Failures:"])
+        for path, findings in failure_entries:
+            lines.append(f"- {path}:")
+            lines.extend(f"  - {finding}" for finding in findings)
+
+    summary = "\n".join(lines)
+
+    if not warning_entries and not failure_entries:
+        return {"errors": "", "review_summary": summary}
+
+    error_lines: list[str] = []
+    for path, findings in failure_entries:
+        for finding in findings:
+            error_lines.append(f"- [{path}] {finding}")
+    for path, findings in warning_entries:
+        for finding in findings:
+            error_lines.append(f"- [{path}] {finding}")
+
+    return {"errors": "\n".join(error_lines), "review_summary": summary}

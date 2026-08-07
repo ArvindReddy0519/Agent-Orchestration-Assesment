@@ -6,7 +6,7 @@ import re
 from pathlib import Path
 
 FILE_BLOCK_PATTERN = re.compile(
-    r"###\s*File:\s*(?P<path>\S+)\s*\n```(?:java|xml)?\s*\n(?P<content>.*?)```",
+    r"###\s*File:\s*(?P<path>\S+)\s*\n```(?:[a-zA-Z0-9_-]+)?\s*\n(?P<content>.*?)```",
     re.DOTALL | re.IGNORECASE,
 )
 
