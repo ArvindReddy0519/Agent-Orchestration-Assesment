@@ -4,7 +4,6 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.types import interrupt
 
 from orchestrator.llm import (
-    extract_python_code,
     format_review_errors,
     get_chat_model,
     message_text,
@@ -12,6 +11,52 @@ from orchestrator.llm import (
 from orchestrator.state import OrchestratorState
 
 MAX_REVIEW_RETRIES = 3
+
+PLANNER_SYSTEM_PROMPT = (
+    "You are a Principal Java Architect. Given a product requirement, produce a "
+    "detailed, step-by-step implementation plan for a Java 17 / Spring Boot 3 "
+    "URL shortener service. Break the work into standard Spring Boot components:\n"
+    "- REST Controllers (@RestController, request mappings, @Valid input)\n"
+    "- Service interfaces and @Service implementations\n"
+    "- Spring Data JPA repositories\n"
+    "- Domain entities (@Entity, relationships, constraints)\n"
+    "- DTOs and request/response records for API boundaries\n"
+    "- Exception handlers with @ControllerAdvice and @ExceptionHandler\n"
+    "- pom.xml dependencies (spring-boot-starter-web, data-jpa, validation, test)\n"
+    "- JUnit 5 tests (@SpringBootTest, MockMvc, repository/service unit tests)\n"
+    "Use numbered steps, name concrete classes/packages, list REST endpoints with HTTP "
+    "verbs and status codes, and keep the plan actionable for engineers."
+)
+
+CODER_SYSTEM_PROMPT = (
+    "You are a Senior Java Developer. Implement the approved plan as idiomatic, "
+    "production-ready Java 17 and Spring Boot 3 code for a URL shortener service.\n\n"
+    "Output requirements:\n"
+    "- Emit every source file using this exact format for each file:\n"
+    "  ### File: src/main/java/com/example/urlshortener/controller/UrlController.java\n"
+    "  ```java\n"
+    "  // code here\n"
+    "  ```\n"
+    "- Include pom.xml, application properties/yml, all Java sources, and JUnit 5 tests.\n"
+    "- Use constructor injection, Jakarta validation (@Valid), proper HTTP status codes, "
+    "and layered architecture (controller -> service -> repository).\n"
+    "- When prior review findings are provided, fix every listed issue in the regenerated files.\n"
+    "- Do not include prose outside file blocks."
+)
+
+REVIEWER_SYSTEM_PROMPT = (
+    "You are a Lead Java Security & QA Auditor. Review the generated Java 17 / "
+    "Spring Boot 3 project against the requirement and plan.\n\n"
+    "Audit for:\n"
+    "- Spring Boot best practices (constructor injection, no field @Autowired)\n"
+    "- Correct JPA entity/repository annotations and transaction boundaries\n"
+    "- Request validation via @Valid and constraint annotations\n"
+    "- Proper HTTP response codes and exception mapping via @ControllerAdvice\n"
+    "- Exception safety, input sanitization, and missing test coverage\n"
+    "- pom.xml dependency correctness for Spring Boot 3\n\n"
+    "If the code is clean with no material issues, respond with exactly: APPROVED\n"
+    "Otherwise return a detailed bulleted list; prefix each finding with '- '."
+)
 
 
 def has_errors(state: OrchestratorState) -> bool:
@@ -36,15 +81,7 @@ def planner(state: OrchestratorState) -> OrchestratorState:
     llm = get_chat_model()
     response = llm.invoke(
         [
-            SystemMessage(
-                content=(
-                    "You are a Senior Software Architect. Given a product requirement, "
-                    "produce a detailed step-by-step task list for implementation. "
-                    "Include concrete deliverables, API endpoints, data models, and "
-                    "testing steps where relevant. Use numbered steps and keep the plan "
-                    "actionable for engineers."
-                )
-            ),
+            SystemMessage(content=PLANNER_SYSTEM_PROMPT),
             HumanMessage(content="\n".join(human_parts)),
         ]
     )
@@ -78,40 +115,31 @@ def route_after_approval(
 
 
 def coder(state: OrchestratorState) -> OrchestratorState:
-    """Generate or update code according to the plan."""
+    """Generate or update multi-file Java/Spring Boot code according to the plan."""
     plan = state.get("plan", "").strip()
     requirement = state.get("requirement", "").strip()
     prior_errors = state.get("errors", "").strip()
-    retry_count = state.get("retry_count", 0)
 
     if not plan:
-        return {"code": "# No plan available to implement."}
+        return {"code": "// No plan available to implement."}
 
     human_parts = [
         f"Original requirement:\n{requirement or '(not specified)'}",
         f"Approved implementation plan:\n{plan}",
     ]
-    if prior_errors and retry_count > 0:
+    if prior_errors:
         human_parts.append(
-            f"Previous review findings (fix these issues):\n{prior_errors}"
+            f"Previous review findings (fix these issues in every affected file):\n{prior_errors}"
         )
 
     llm = get_chat_model()
     response = llm.invoke(
         [
-            SystemMessage(
-                content=(
-                    "You are a Senior Software Engineer. Implement the approved plan as "
-                    "complete, runnable Python using FastAPI. Output only raw Python source "
-                    "code (no prose). Include imports, app setup, routes, and models as "
-                    "needed. Do not wrap the code in markdown unless necessary."
-                )
-            ),
+            SystemMessage(content=CODER_SYSTEM_PROMPT),
             HumanMessage(content="\n\n".join(human_parts)),
         ]
     )
-    code = extract_python_code(message_text(response.content))
-    return {"code": code}
+    return {"code": message_text(response.content).strip()}
 
 
 def reviewer(state: OrchestratorState) -> OrchestratorState:
@@ -126,20 +154,12 @@ def reviewer(state: OrchestratorState) -> OrchestratorState:
     llm = get_chat_model()
     response = llm.invoke(
         [
-            SystemMessage(
-                content=(
-                    "You are a QA and application security auditor. Review the FastAPI "
-                    "Python code against the requirement and plan. Report bugs, missing "
-                    "features, unsafe patterns, and test gaps. If there are no material "
-                    "issues, respond with exactly: NO_FINDINGS. Otherwise list each "
-                    "finding on its own line prefixed with '- '."
-                )
-            ),
+            SystemMessage(content=REVIEWER_SYSTEM_PROMPT),
             HumanMessage(
                 content=(
                     f"Requirement:\n{requirement or '(not specified)'}\n\n"
                     f"Plan:\n{plan or '(not specified)'}\n\n"
-                    f"Code:\n{code}"
+                    f"Generated project files:\n{code}"
                 )
             ),
         ]

@@ -72,7 +72,7 @@ def demo_approved(requirement: str) -> None:
     _print_state(final)
 
 
-def demo_rejected_then_approved(requirement: str) -> None:
+def demo_rejected(requirement: str) -> None:
     graph, config = run_until_interrupt(requirement)
 
     print("Resuming with Command(resume='Rejected: Please change X')")
@@ -116,8 +116,8 @@ def main() -> None:
 
     if args.scenario == "approved":
         demo_approved(args.requirement)
-    else:
-        demo_rejected_then_approved(args.requirement)
+    elif args.scenario == "rejected":
+        demo_rejected(args.requirement)
 
 
 if __name__ == "__main__":
