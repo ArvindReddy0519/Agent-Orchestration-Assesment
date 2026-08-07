@@ -59,7 +59,7 @@ def extract_python_code(text: str) -> str:
 
 
 def parse_review_findings(text: str) -> list[str]:
-    """Parse reviewer output into a list of error/finding strings."""
+    """Parse reviewer output into individual finding strings."""
     stripped = text.strip()
     if not stripped or stripped.upper() == "NO_FINDINGS":
         return []
@@ -74,3 +74,11 @@ def parse_review_findings(text: str) -> list[str]:
         if line:
             findings.append(line)
     return findings
+
+
+def format_review_errors(text: str) -> str:
+    """Normalize reviewer LLM output to a single errors string (empty if pass)."""
+    findings = parse_review_findings(text)
+    if not findings:
+        return ""
+    return "\n".join(f"- {finding}" for finding in findings)

@@ -7,5 +7,6 @@ class OrchestratorState(TypedDict, total=False):
     requirement: str
     plan: str
     code: str
-    errors: list[str]
+    errors: str
+    retry_count: int
     human_feedback: str

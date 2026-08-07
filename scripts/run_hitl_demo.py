@@ -44,7 +44,10 @@ def run_until_interrupt(requirement: str) -> tuple[object, dict]:
     graph = build_graph()
     config = {"configurable": {"thread_id": str(uuid.uuid4())}}
 
-    result = graph.invoke({"requirement": requirement}, config)
+    result = graph.invoke(
+        {"requirement": requirement, "retry_count": 0, "errors": ""},
+        config,
+    )
 
     interrupts = result.get("__interrupt__") if isinstance(result, dict) else None
     if interrupts:
@@ -84,7 +87,7 @@ def demo_rejected_then_approved(requirement: str) -> None:
 
 def _print_state(state: dict) -> None:
     print("\nFinal state:")
-    for key in ("requirement", "plan", "human_feedback", "code", "errors"):
+    for key in ("requirement", "plan", "human_feedback", "code", "errors", "retry_count"):
         if key in state:
             print(f"  {key}: {state[key]!r}")
 

@@ -5,11 +5,18 @@ from langgraph.types import interrupt
 
 from orchestrator.llm import (
     extract_python_code,
+    format_review_errors,
     get_chat_model,
     message_text,
-    parse_review_findings,
 )
 from orchestrator.state import OrchestratorState
+
+MAX_REVIEW_RETRIES = 3
+
+
+def has_errors(state: OrchestratorState) -> bool:
+    """Strict check: non-empty errors string means review failed."""
+    return bool(state.get("errors", "").strip())
 
 
 def planner(state: OrchestratorState) -> OrchestratorState:
@@ -74,9 +81,20 @@ def coder(state: OrchestratorState) -> OrchestratorState:
     """Generate or update code according to the plan."""
     plan = state.get("plan", "").strip()
     requirement = state.get("requirement", "").strip()
+    prior_errors = state.get("errors", "").strip()
+    retry_count = state.get("retry_count", 0)
 
     if not plan:
         return {"code": "# No plan available to implement."}
+
+    human_parts = [
+        f"Original requirement:\n{requirement or '(not specified)'}",
+        f"Approved implementation plan:\n{plan}",
+    ]
+    if prior_errors and retry_count > 0:
+        human_parts.append(
+            f"Previous review findings (fix these issues):\n{prior_errors}"
+        )
 
     llm = get_chat_model()
     response = llm.invoke(
@@ -89,12 +107,7 @@ def coder(state: OrchestratorState) -> OrchestratorState:
                     "needed. Do not wrap the code in markdown unless necessary."
                 )
             ),
-            HumanMessage(
-                content=(
-                    f"Original requirement:\n{requirement or '(not specified)'}\n\n"
-                    f"Approved implementation plan:\n{plan}"
-                )
-            ),
+            HumanMessage(content="\n\n".join(human_parts)),
         ]
     )
     code = extract_python_code(message_text(response.content))
@@ -102,13 +115,13 @@ def coder(state: OrchestratorState) -> OrchestratorState:
 
 
 def reviewer(state: OrchestratorState) -> OrchestratorState:
-    """Review code and record errors or approval signals."""
+    """Review code; set errors when issues exist, clear errors on pass."""
     code = state.get("code", "").strip()
     plan = state.get("plan", "").strip()
     requirement = state.get("requirement", "").strip()
 
     if not code:
-        return {"errors": ["No code was generated to review."]}
+        return {"errors": "No code was generated to review."}
 
     llm = get_chat_model()
     response = llm.invoke(
@@ -131,5 +144,24 @@ def reviewer(state: OrchestratorState) -> OrchestratorState:
             ),
         ]
     )
-    findings = parse_review_findings(message_text(response.content))
-    return {"errors": findings}
+    errors = format_review_errors(message_text(response.content))
+    return {"errors": errors}
+
+
+def increment_retry(state: OrchestratorState) -> OrchestratorState:
+    """Bump retry_count before sending execution back to the coder."""
+    return {"retry_count": state.get("retry_count", 0) + 1}
+
+
+def route_after_reviewer(
+    state: OrchestratorState,
+) -> Literal["increment_retry", "__end__"]:
+    """Route to bounded coder retries or safe-stop at END."""
+    if not has_errors(state):
+        return "__end__"
+
+    retry_count = state.get("retry_count", 0)
+    if retry_count < MAX_REVIEW_RETRIES:
+        return "increment_retry"
+
+    return "__end__"
